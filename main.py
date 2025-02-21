@@ -17,6 +17,7 @@ import torch.utils as utils
 
 from script import dataloader, utility, earlystopping, opt
 from model import models
+import pdb
 
 #import nni
 
@@ -95,9 +96,15 @@ def get_parameters():
 
 def data_preparate(args, device):    
     adj, n_vertex = dataloader.load_adj(args.dataset)
+    print(f'NUMBER OF VERTICES: {n_vertex}')
     gso = utility.calc_gso(adj, args.gso_type)
-    if args.graph_conv_type == 'cheb_graph_conv':
-        gso = utility.calc_chebynet_gso(gso)
+    gso_coo = gso.tocoo()
+    edge_index = torch.tensor([gso_coo.row, gso_coo.col], dtype=torch.long)
+
+    print(edge_index.max())
+    print(edge_index.shape)
+    print(n_vertex)
+
     gso = gso.toarray()
     gso = gso.astype(dtype=np.float32)
     args.gso = torch.from_numpy(gso).to(device)
@@ -119,9 +126,9 @@ def data_preparate(args, device):
     val = zscore.transform(val)
     test = zscore.transform(test)
 
-    x_train, y_train = dataloader.data_transform(train, args.n_his, args.n_pred, device)
-    x_val, y_val = dataloader.data_transform(val, args.n_his, args.n_pred, device)
-    x_test, y_test = dataloader.data_transform(test, args.n_his, args.n_pred, device)
+    x_train, y_train, adj_train = dataloader.data_transform(train, args.n_his, args.n_pred, n_vertex, edge_index)
+    x_val, y_val, adj_val = dataloader.data_transform(val, args.n_his, args.n_pred, n_vertex, edge_index)
+    x_test, y_test, adj_test = dataloader.data_transform(test, args.n_his, args.n_pred, n_vertex, edge_index)
 
     train_data = utils.data.TensorDataset(x_train, y_train)
     train_iter = utils.data.DataLoader(dataset=train_data, batch_size=args.batch_size, shuffle=False)
@@ -130,19 +137,16 @@ def data_preparate(args, device):
     test_data = utils.data.TensorDataset(x_test, y_test)
     test_iter = utils.data.DataLoader(dataset=test_data, batch_size=args.batch_size, shuffle=False)
 
-    return n_vertex, zscore, train_iter, val_iter, test_iter
+    return n_vertex, zscore, train_iter, val_iter, test_iter, adj_train, adj_val, adj_test
 
-def prepare_model(args, blocks, n_vertex):
+def prepare_model(args, blocks, n_vertex, adj_train, adj_val, adj_test, mode):
     loss = nn.MSELoss()
     es = earlystopping.EarlyStopping(delta=0.0, 
                                      patience=args.patience, 
                                      verbose=True, 
                                      path="STCGN_" + args.dataset + ".pt")
 
-    if args.graph_conv_type == 'cheb_graph_conv':
-        model = models.STGCNChebGraphConv(args, blocks, n_vertex).to(device)
-    else:
-        model = models.STGCNGraphConv(args, blocks, n_vertex).to(device)
+    model = models.STGCNGraphConv(args, blocks, n_vertex, adj_train, adj_val, adj_test, mode).to(device)
 
     if args.opt == "adamw":
         optimizer = optim.AdamW(params=model.parameters(), lr=args.lr, weight_decay=args.weight_decay_rate)
@@ -212,7 +216,7 @@ if __name__ == "__main__":
     warnings.filterwarnings("ignore", category=UserWarning)
 
     args, device, blocks = get_parameters()
-    n_vertex, zscore, train_iter, val_iter, test_iter = data_preparate(args, device)
-    loss, es, model, optimizer, scheduler = prepare_model(args, blocks, n_vertex)
+    n_vertex, zscore, train_iter, val_iter, test_iter, adj_train, adj_val, adj_test = data_preparate(args, device)
+    loss, es, model, optimizer, scheduler = prepare_model(args, blocks, n_vertex, adj_train, adj_val, adj_test, 'train')
     train(args, model, loss, optimizer, scheduler, es, train_iter, val_iter)
     test(zscore, loss, model, test_iter, args)
