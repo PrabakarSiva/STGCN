@@ -2,6 +2,7 @@ import numpy as np
 import scipy.sparse as sp
 from scipy.sparse.linalg import norm
 import torch
+import tqdm
 
 def calc_gso(dir_adj, gso_type):
     n_vertex = dir_adj.shape[0]
@@ -91,8 +92,8 @@ def evaluate_model(model, loss, data_iter, edge_index):
     model.eval()
     l_sum, n = 0.0, 0
     with torch.no_grad():
-        for x, y in data_iter:
-            y_pred, _ = model(x, edge_index)  # Ignore adj_pred
+        for x, y in tqdm.tqdm(data_iter, desc='Evaluating MSE'):
+            y_pred, _ = model(x, edge_index)
             y_pred = y_pred.view(len(x), -1)
             l = loss(y_pred, y)
             l_sum += l.item() * y.shape[0]
@@ -105,9 +106,9 @@ def evaluate_metric(model, data_iter, scaler, edge_index):
     model.eval()
     with torch.no_grad():
         mae, sum_y, mape, mse = [], [], [], []
-        for x, y in data_iter:
+        for x, y in tqdm.tqdm(data_iter, desc='Evaluating Metrics'):
             y = scaler.inverse_transform(y.cpu().numpy()).reshape(-1)
-            y_pred, _ = model(x, edge_index)  # Ignore adj_pred
+            y_pred, _ = model(x, edge_index)
             y_pred = scaler.inverse_transform(y_pred.view(len(x), -1).cpu().numpy()).reshape(-1)
             d = np.abs(y - y_pred)
             mae += d.tolist()
