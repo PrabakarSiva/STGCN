@@ -167,24 +167,21 @@ class GraphConvLayer(nn.Module):
         self.graph_conv = GraphSAGE(c_out, 32, 3, c_out)
 
     def forward(self, x, edge_index):
-        
         x_gc_in = self.align(x)
+        batch_size, channels, timesteps, num_nodes = x_gc_in.shape
 
-        x_gc = []
-        batch_size, _, timesteps, num_nodes = x_gc_in.shape
-        channels = self.c_out
+        x_reshaped = x_gc_in.permute(0, 2, 3, 1).reshape(-1, channels)
 
-        for t in range(timesteps):
-            x_t = x_gc_in[:, :, t, :].reshape(-1, channels)
-            x_gc_t = self.graph_conv(x_t, edge_index)
-            x_gc.append(x_gc_t)
+        x_gc = self.graph_conv(x_reshaped, edge_index)
 
-        x_gc = torch.stack(x_gc, dim=2)
-        x_gc = x_gc.view(batch_size, num_nodes, -1, timesteps)
-        x_gc = x_gc.permute(0, 2, 3, 1)
-
+        x_gc = x_gc.view(batch_size, timesteps, num_nodes, -1)
+        x_gc = x_gc.permute(0, 3, 1, 2)
+        
         x_gc_out = torch.add(x_gc, x_gc_in)
 
+        del x_reshaped, x_gc
+        torch.cuda.empty_cache()
+        
         return x_gc_out
 
 class STConvBlock(nn.Module):
@@ -195,19 +192,18 @@ class STConvBlock(nn.Module):
     # N: Layer Normolization
     # D: Dropout
 
-    def __init__(self, Kt, Ks, n_vertex, last_block_channel, channels, act_func, gso, bias, droprate, edge_index):
+    def __init__(self, Kt, Ks, n_vertex, last_block_channel, channels, act_func, gso, bias, droprate):
         super(STConvBlock, self).__init__()
         self.tmp_conv1 = TemporalConvLayer(Kt, last_block_channel, channels[0], n_vertex, act_func)
-        self.edge_index = edge_index
         self.graph_conv = GraphConvLayer(channels[0], channels[1], Ks, gso)
         self.tmp_conv2 = TemporalConvLayer(Kt, channels[1], channels[2], n_vertex, act_func)
         self.tc2_ln = nn.LayerNorm([n_vertex, channels[2]], eps=1e-12)
         self.relu = nn.ReLU()
         self.dropout = nn.Dropout(p=droprate)
 
-    def forward(self, x):
+    def forward(self, x, edge_index):
         x = self.tmp_conv1(x)
-        x = self.graph_conv(x, self.edge_index)
+        x = self.graph_conv(x, edge_index)
         x = self.relu(x)
         x = self.tmp_conv2(x)
         x = self.tc2_ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
@@ -239,4 +235,11 @@ class OutputBlock(nn.Module):
         x = self.dropout(x)
         x = self.fc2(x).permute(0, 3, 1, 2)
 
-        return x
+        node_embeddings = x.squeeze(-1)
+        
+        adj_pred = torch.matmul(node_embeddings, node_embeddings.transpose(-1, -2))
+        adj_pred = torch.sigmoid(adj_pred)
+        
+        self.predicted_adj = adj_pred.detach().cpu().numpy()
+
+        return x, adj_pred

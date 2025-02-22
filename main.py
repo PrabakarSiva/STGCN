@@ -17,9 +17,11 @@ import torch.utils as utils
 
 from script import dataloader, utility, earlystopping, opt
 from model import models
+import networkx as nx
+from torch_geometric.utils import to_dense_adj
 import pdb
-
 #import nni
+
 
 def set_env(seed):
     # Set available CUDA devices
@@ -55,7 +57,7 @@ def get_parameters():
     parser.add_argument('--droprate', type=float, default=0.5)
     parser.add_argument('--lr', type=float, default=0.001, help='learning rate')
     parser.add_argument('--weight_decay_rate', type=float, default=0.001, help='weight decay (L2 penalty)')
-    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--epochs', type=int, default=1000, help='epochs, default as 1000')
     parser.add_argument('--opt', type=str, default='adamw', choices=['adamw', 'nadamw', 'lion'], help='optimizer, default as nadamw')
     parser.add_argument('--step_size', type=int, default=10)
@@ -99,7 +101,7 @@ def data_preparate(args, device):
     print(f'NUMBER OF VERTICES: {n_vertex}')
     gso = utility.calc_gso(adj, args.gso_type)
     gso_coo = gso.tocoo()
-    edge_index = torch.tensor([gso_coo.row, gso_coo.col], dtype=torch.long)
+    edge_index = torch.tensor([gso_coo.row, gso_coo.col], dtype=torch.long).to("cuda:0")
 
     print(edge_index.max())
     print(edge_index.shape)
@@ -112,8 +114,7 @@ def data_preparate(args, device):
     dataset_path = './data'
     dataset_path = os.path.join(dataset_path, args.dataset)
     data_col = pd.read_csv(os.path.join(dataset_path, 'vel.csv')).shape[0]
-    # recommended dataset split rate as train: val: test = 60: 20: 20, 70: 15: 15 or 80: 10: 10
-    # using dataset split rate as train: val: test = 70: 15: 15
+
     val_and_test_rate = 0.15
 
     len_val = int(math.floor(data_col * val_and_test_rate))
@@ -126,9 +127,9 @@ def data_preparate(args, device):
     val = zscore.transform(val)
     test = zscore.transform(test)
 
-    x_train, y_train, adj_train = dataloader.data_transform(train, args.n_his, args.n_pred, n_vertex, edge_index)
-    x_val, y_val, adj_val = dataloader.data_transform(val, args.n_his, args.n_pred, n_vertex, edge_index)
-    x_test, y_test, adj_test = dataloader.data_transform(test, args.n_his, args.n_pred, n_vertex, edge_index)
+    x_train, y_train = dataloader.data_transform(train, args.n_his, args.n_pred, n_vertex)
+    x_val, y_val = dataloader.data_transform(val, args.n_his, args.n_pred, n_vertex)
+    x_test, y_test = dataloader.data_transform(test, args.n_his, args.n_pred, n_vertex)
 
     train_data = utils.data.TensorDataset(x_train, y_train)
     train_iter = utils.data.DataLoader(dataset=train_data, batch_size=args.batch_size, shuffle=False)
@@ -137,16 +138,16 @@ def data_preparate(args, device):
     test_data = utils.data.TensorDataset(x_test, y_test)
     test_iter = utils.data.DataLoader(dataset=test_data, batch_size=args.batch_size, shuffle=False)
 
-    return n_vertex, zscore, train_iter, val_iter, test_iter, adj_train, adj_val, adj_test
+    return n_vertex, zscore, train_iter, val_iter, test_iter, edge_index
 
-def prepare_model(args, blocks, n_vertex, adj_train, adj_val, adj_test, mode):
+def prepare_model(args, blocks, n_vertex):
     loss = nn.MSELoss()
     es = earlystopping.EarlyStopping(delta=0.0, 
                                      patience=args.patience, 
                                      verbose=True, 
                                      path="STCGN_" + args.dataset + ".pt")
 
-    model = models.STGCNGraphConv(args, blocks, n_vertex, adj_train, adj_val, adj_test, mode).to(device)
+    model = models.STGCNGraphConv(args, blocks, n_vertex).to(device)
 
     if args.opt == "adamw":
         optimizer = optim.AdamW(params=model.parameters(), lr=args.lr, weight_decay=args.weight_decay_rate)
@@ -161,49 +162,89 @@ def prepare_model(args, blocks, n_vertex, adj_train, adj_val, adj_test, mode):
 
     return loss, es, model, optimizer, scheduler
 
-def train(args, model, loss, optimizer, scheduler, es, train_iter, val_iter):
+def train(args, model, loss, optimizer, scheduler, es, train_iter, val_iter, edge_index):
+    lambda_ge = 0.1
+    max_grad_norm = 5.0  # Add gradient clipping threshold
+
     for epoch in range(args.epochs):
-        l_sum, n = 0.0, 0  # 'l_sum' is epoch sum loss, 'n' is epoch instance number
+        l_sum, n = 0.0, 0
         model.train()
+        epoch_adj_preds = []
+        epoch_main_loss = 0.0
+        n = 0
+
+        true_adj = to_dense_adj(edge_index)[0].cpu().numpy()
+        G_true = nx.from_numpy_array(true_adj)
+        del true_adj
+        
         for x, y in tqdm.tqdm(train_iter):
             optimizer.zero_grad()
-            y_pred = model(x).view(len(x), -1)  # [batch_size, num_nodes]
-            l = loss(y_pred, y)
-            l.backward()
+            y_pred, adj_pred = model(x, edge_index)
+            
+            main_loss = loss(y_pred.view(len(x), -1), y)
+
+            epoch_adj_preds.append(adj_pred.mean(dim=1).detach().cpu())
+            
+            main_loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            
             optimizer.step()
-            l_sum += l.item() * y.shape[0]
+            
+            epoch_main_loss += main_loss.item() * y.shape[0]
             n += y.shape[0]
+
+            del y_pred, adj_pred, main_loss
+            torch.cuda.empty_cache()
+
+        avg_adj_pred = torch.mean(torch.stack(epoch_adj_preds, dim=0), dim=0).numpy()
+        G_pred = nx.from_numpy_array(avg_adj_pred)
+        del avg_adj_pred
+        
+        ged = nx.graph_edit_distance(G_pred, G_true)
+        ge_loss = next(ged)
+        
+        ge_loss_tensor = torch.tensor(ge_loss, device=device, requires_grad=True)
+        (lambda_ge * ge_loss_tensor).backward()
+        optimizer.step()
+        
+        l_sum = epoch_main_loss + lambda_ge * ge_loss
+
+        del epoch_adj_preds, G_pred, G_true, ge_loss_tensor
+        torch.cuda.empty_cache()
+        
+        print(f'Epoch Loss: Main = {epoch_main_loss/n:.6f}, Graph Edit = {ge_loss:.6f}, Total = {l_sum/n:.6f}')
+        
         scheduler.step()
-        val_loss = val(model, val_iter)
-        # GPU memory usage
-        gpu_mem_alloc = torch.cuda.max_memory_allocated() / 1000000 if torch.cuda.is_available() else 0
-        print('Epoch: {:03d} | Lr: {:.20f} |Train loss: {:.6f} | Val loss: {:.6f} | GPU occupy: {:.6f} MiB'.\
-            format(epoch+1, optimizer.param_groups[0]['lr'], l_sum / n, val_loss, gpu_mem_alloc))
+        val_loss = val(model, edge_index, val_iter)
+        print(f'Epoch: {epoch+1:03d} | Train Loss: {l_sum / n:.6f} | Val Loss: {val_loss:.6f}')
 
         es(val_loss, model)
         if es.early_stop:
             print("Early stopping")
             break
 
+
 @torch.no_grad()
-def val(model, val_iter):
+def val(model, edge_index, val_iter):
     model.eval()
 
     l_sum, n = 0.0, 0
     for x, y in val_iter:
-        y_pred = model(x).view(len(x), -1)
+        y_pred, _ = model(x, edge_index)
+        y_pred = y_pred.view(len(x), -1)
         l = loss(y_pred, y)
         l_sum += l.item() * y.shape[0]
         n += y.shape[0]
     return torch.tensor(l_sum / n)
 
 @torch.no_grad() 
-def test(zscore, loss, model, test_iter, args):
+def test(zscore, loss, model, test_iter, edge_index, args):
     model.load_state_dict(torch.load("STGCN_" + args.dataset + ".pt"))
     model.eval()
 
-    test_MSE = utility.evaluate_model(model, loss, test_iter)
-    test_MAE, test_RMSE, test_WMAPE = utility.evaluate_metric(model, test_iter, zscore)
+    test_MSE = utility.evaluate_model(model, loss, test_iter, edge_index)
+    test_MAE, test_RMSE, test_WMAPE = utility.evaluate_metric(model, test_iter, zscore, edge_index)
     print(f'Dataset {args.dataset:s} | Test loss {test_MSE:.6f} | MAE {test_MAE:.6f} | RMSE {test_RMSE:.6f} | WMAPE {test_WMAPE:.8f}')
 
 if __name__ == "__main__":
@@ -216,7 +257,7 @@ if __name__ == "__main__":
     warnings.filterwarnings("ignore", category=UserWarning)
 
     args, device, blocks = get_parameters()
-    n_vertex, zscore, train_iter, val_iter, test_iter, adj_train, adj_val, adj_test = data_preparate(args, device)
-    loss, es, model, optimizer, scheduler = prepare_model(args, blocks, n_vertex, adj_train, adj_val, adj_test, 'train')
-    train(args, model, loss, optimizer, scheduler, es, train_iter, val_iter)
-    test(zscore, loss, model, test_iter, args)
+    n_vertex, zscore, train_iter, val_iter, test_iter, edge_index = data_preparate(args, device)
+    loss, es, model, optimizer, scheduler = prepare_model(args, blocks, n_vertex)
+    train(args, model, loss, optimizer, scheduler, es, train_iter, val_iter, edge_index)
+    test(zscore, loss, model, test_iter, edge_index, args)

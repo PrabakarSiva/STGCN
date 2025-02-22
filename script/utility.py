@@ -87,12 +87,13 @@ def cnv_sparse_mat_to_coo_tensor(sp_mat, device):
     else:
         raise TypeError(f'ERROR: The dtype of {sp_mat} is {sp_mat.dtype}, not been applied in implemented models.')
 
-def evaluate_model(model, loss, data_iter):
+def evaluate_model(model, loss, data_iter, edge_index):
     model.eval()
     l_sum, n = 0.0, 0
     with torch.no_grad():
         for x, y in data_iter:
-            y_pred = model(x).view(len(x), -1)
+            y_pred, _ = model(x, edge_index)  # Ignore adj_pred
+            y_pred = y_pred.view(len(x), -1)
             l = loss(y_pred, y)
             l_sum += l.item() * y.shape[0]
             n += y.shape[0]
@@ -100,13 +101,14 @@ def evaluate_model(model, loss, data_iter):
         
         return mse
 
-def evaluate_metric(model, data_iter, scaler):
+def evaluate_metric(model, data_iter, scaler, edge_index):
     model.eval()
     with torch.no_grad():
         mae, sum_y, mape, mse = [], [], [], []
         for x, y in data_iter:
             y = scaler.inverse_transform(y.cpu().numpy()).reshape(-1)
-            y_pred = scaler.inverse_transform(model(x).view(len(x), -1).cpu().numpy()).reshape(-1)
+            y_pred, _ = model(x, edge_index)  # Ignore adj_pred
+            y_pred = scaler.inverse_transform(y_pred.view(len(x), -1).cpu().numpy()).reshape(-1)
             d = np.abs(y - y_pred)
             mae += d.tolist()
             sum_y += y.tolist()
