@@ -30,9 +30,7 @@ def load_data(dataset_name, len_train, len_val):
     test = vel[len_train + len_val:]
     return train, val, test
 
-def data_transform(data, n_his, n_pred, n_vertex, device=None):
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def data_transform(data, n_his, n_pred, n_vertex, device="cuda:0"):
     len_record = len(data)
     num = len_record - n_his - n_pred
 

@@ -65,4 +65,3 @@ class STGCNGraphConv(nn.Module):
             adj_pred = torch.sigmoid(adj_pred)
             
         return x, adj_pred
-

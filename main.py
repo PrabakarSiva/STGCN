@@ -17,13 +17,10 @@ import torch.utils as utils
 
 from script import dataloader, utility, earlystopping, opt
 from model import models
-import networkx as nx
 from torch_geometric.utils import to_dense_adj
 import pdb
 #import nni
 
-# Global device variable
-device = None
 
 def set_env(seed):
     # Set available CUDA devices
@@ -42,7 +39,6 @@ def set_env(seed):
     # torch.use_deterministic_algorithms(True)
 
 def get_parameters():
-    global device
     parser = argparse.ArgumentParser(description='STGCN')
     parser.add_argument('--enable_cuda', type=bool, default=True, help='enable CUDA, default as True')
     parser.add_argument('--seed', type=int, default=42, help='set the random seed for stabilizing experiment results')
@@ -104,7 +100,7 @@ def data_preparate(args, device):
     print(f'NUMBER OF VERTICES: {n_vertex}')
     gso = utility.calc_gso(adj, args.gso_type)
     gso_coo = gso.tocoo()
-    edge_index = torch.tensor([gso_coo.row, gso_coo.col], dtype=torch.long).to(device)
+    edge_index = torch.tensor([gso_coo.row, gso_coo.col], dtype=torch.long).to("cuda:0")
 
     print(edge_index.max())
     print(edge_index.shape)
@@ -130,9 +126,9 @@ def data_preparate(args, device):
     val = zscore.transform(val)
     test = zscore.transform(test)
 
-    x_train, y_train = dataloader.data_transform(train, args.n_his, args.n_pred, n_vertex, device)
-    x_val, y_val = dataloader.data_transform(val, args.n_his, args.n_pred, n_vertex, device)
-    x_test, y_test = dataloader.data_transform(test, args.n_his, args.n_pred, n_vertex, device)
+    x_train, y_train = dataloader.data_transform(train, args.n_his, args.n_pred, n_vertex)
+    x_val, y_val = dataloader.data_transform(val, args.n_his, args.n_pred, n_vertex)
+    x_test, y_test = dataloader.data_transform(test, args.n_his, args.n_pred, n_vertex)
 
     train_data = utils.data.TensorDataset(x_train, y_train)
     train_iter = utils.data.DataLoader(dataset=train_data, batch_size=args.batch_size, shuffle=False)
@@ -145,11 +141,10 @@ def data_preparate(args, device):
 
 def prepare_model(args, blocks, n_vertex):
     loss = nn.MSELoss()
-    path_to_save = f'/media/data2/ITS/STGCN/STGCN_{args.dataset}.pt'
     es = earlystopping.EarlyStopping(delta=0.0, 
                                      patience=args.patience, 
                                      verbose=True, 
-                                     path=path_to_save)
+                                     path="STCGN_" + args.dataset + ".pt")
 
     model = models.STGCNGraphConv(args, blocks, n_vertex).to(device)
 
@@ -169,11 +164,6 @@ def prepare_model(args, blocks, n_vertex):
 def train(args, model, loss, optimizer, scheduler, es, train_iter, val_iter, edge_index):
     lambda_ge = 0.1
     max_grad_norm = 5.0
-    
-    train_loss_file = open('train_losses.txt', 'w')
-    val_loss_file = open('val_losses.txt', 'w')
-    
-    print("Starting training...")
 
     for epoch in range(args.epochs):
         l_sum, n = 0.0, 0
@@ -183,101 +173,69 @@ def train(args, model, loss, optimizer, scheduler, es, train_iter, val_iter, edg
         n = 0
 
         true_adj = to_dense_adj(edge_index)[0].cpu().numpy()
-        G_true = nx.from_numpy_array(true_adj)
-        del true_adj
         
-        for x, y in tqdm.tqdm(train_iter, desc=f'Epoch {epoch+1}/{args.epochs}'):
-            x, y = x.to(device), y.to(device)  # Ensure data is on correct device
+        for x, y in tqdm.tqdm(train_iter):
             optimizer.zero_grad()
             y_pred, adj_pred = model(x, edge_index)
             
             main_loss = loss(y_pred.view(len(x), -1), y)
 
-            epoch_adj_preds.append(adj_pred.mean(dim=1).detach().cpu())
-            
-            main_loss.backward()
+            batch_frob_loss = utility.calculate_frobenius_distance(adj_pred, true_adj)
 
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            total_loss = main_loss + lambda_ge * torch.tensor(batch_frob_loss, device=device, requires_grad=True)
+            total_loss.backward()
             
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             optimizer.step()
             
             epoch_main_loss += main_loss.item() * y.shape[0]
             n += y.shape[0]
 
-            del y_pred, adj_pred, main_loss
-            torch.cuda.empty_cache()
-
-        all_adj_preds = torch.cat(epoch_adj_preds, dim=0)
-        avg_adj_pred = torch.mean(all_adj_preds, dim=0).numpy()
-        G_pred = nx.from_numpy_array(avg_adj_pred)
-        del avg_adj_pred
-        
-        ged = nx.graph_edit_distance(G_pred, G_true)
-        ge_loss = next(ged)
-        
-        ge_loss_tensor = torch.tensor(ge_loss, device=device, requires_grad=True)
-        (lambda_ge * ge_loss_tensor).backward()
-        optimizer.step()
-        
-        l_sum = epoch_main_loss + lambda_ge * ge_loss
-
-        del epoch_adj_preds, G_pred, G_true, ge_loss_tensor
+            del y_pred, adj_pred, main_loss, total_loss
         torch.cuda.empty_cache()
         
-        train_loss = l_sum / n
-        print(f'Epoch Loss: Main = {epoch_main_loss/n:.6f}, Graph Edit = {ge_loss:.6f}, Total = {train_loss:.6f}')
+        train_loss = (epoch_main_loss + lambda_ge * batch_frob_loss)/n
+        print(f'Epoch Loss: Main = {epoch_main_loss/n:.6f}, Frobenius = {batch_frob_loss:.6f}, Total = {train_loss:.6f}')
+
+        with open('train_losses.txt', 'a') as f:
+            f.write(f'{train_loss:.6f}\n')
         
         scheduler.step()
-        val_loss = val(model, edge_index, val_iter, loss)
+        val_loss = val(model, edge_index, val_iter)
         print(f'Epoch: {epoch+1:03d} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}')
-        
-        train_loss_file.write(f'Epoch {epoch+1}: {train_loss:.6f}\n')
-        val_loss_file.write(f'Epoch {epoch+1}: {val_loss:.6f}\n')
 
         es(val_loss, model)
         if es.early_stop:
             print("Early stopping")
-            train_loss_file.close()
-            val_loss_file.close()
             break
-
-    train_loss_file.close()
-    val_loss_file.close()
 
 
 @torch.no_grad()
-def val(model, edge_index, val_iter, loss):
+def val(model, edge_index, val_iter):
     model.eval()
-    print("\nRunning validation...")
 
     l_sum, n = 0.0, 0
-    for x, y in tqdm.tqdm(val_iter, desc='Validating'):
-        x, y = x.to(device), y.to(device)
+    for x, y in val_iter:
         y_pred, _ = model(x, edge_index)
         y_pred = y_pred.view(len(x), -1)
         l = loss(y_pred, y)
         l_sum += l.item() * y.shape[0]
         n += y.shape[0]
-    return torch.tensor(l_sum / n, device=device)
+    return torch.tensor(l_sum / n)
 
 @torch.no_grad() 
 def test(zscore, loss, model, test_iter, edge_index, args):
-    model.load_state_dict(torch.load(f"STGCN_{args.dataset}.pt"))
+    model.load_state_dict(torch.load("STGCN_" + args.dataset + ".pt"))
     model.eval()
-    
-    test_results_file = open('test_results.txt', 'w')
-    
-    print("\nTesting model...")
+
     test_MSE = utility.evaluate_model(model, loss, test_iter, edge_index)
     test_MAE, test_RMSE, test_WMAPE = utility.evaluate_metric(model, test_iter, zscore, edge_index)
-    
-    result_str = f'Dataset {args.dataset:s} | Test loss {test_MSE:.6f} | MAE {test_MAE:.6f} | RMSE {test_RMSE:.6f} | WMAPE {test_WMAPE:.8f}'
-    print(result_str)
-    test_results_file.write(result_str + '\n')
-    test_results_file.close()
+    print(f'Dataset {args.dataset:s} | Test loss {test_MSE:.6f} | MAE {test_MAE:.6f} | RMSE {test_RMSE:.6f} | WMAPE {test_WMAPE:.8f}')
 
 if __name__ == "__main__":
     # Logging
+    #logger = logging.getLogger('stgcn')
+    #logging.basicConfig(filename='stgcn.log', level=logging.INFO)
     logging.basicConfig(level=logging.INFO)
 
     warnings.filterwarnings("ignore", category=FutureWarning)
