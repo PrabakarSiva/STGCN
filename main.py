@@ -144,7 +144,7 @@ def prepare_model(args, blocks, n_vertex, adj_train, adj_val, adj_test, mode):
     es = earlystopping.EarlyStopping(delta=0.0, 
                                      patience=args.patience, 
                                      verbose=True, 
-                                     path="STCGN_" + args.dataset + ".pt")
+                                     path="STGCN_" + args.dataset + ".pt")
 
     model = models.STGCNGraphConv(args, blocks, n_vertex, adj_train, adj_val, adj_test, mode).to(device)
 
