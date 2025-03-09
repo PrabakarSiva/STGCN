@@ -8,8 +8,18 @@ import pdb
 def load_adj(dataset_name):
     dataset_path = './data'
     dataset_path = os.path.join(dataset_path, dataset_name)
-    adj = sp.load_npz(os.path.join(dataset_path, 'adj.npz'))
-    adj = adj.tocsc()
+    if dataset_name == 'urban1':
+        adj = pd.read_csv(os.path.join(dataset_path, 'adj.csv'), header=None).replace([np.inf, -np.inf], np.nan).interpolate(method='linear')
+        print(adj.isin([np.inf, -np.inf, np.nan]).sum().sum())
+        adj = adj.interpolate(method='linear', axis=1)
+        print(adj.isin([np.nan]).sum().sum())
+        print("adj df shape: ", adj.shape)
+        adj = sp.csc_matrix(adj.values)
+        print("adj shape: ", adj.shape)
+    else:
+        adj = sp.load_npz(os.path.join(dataset_path, 'adj.npz'))
+        adj = adj.tocsc()
+    
     
     if dataset_name == 'metr-la':
         n_vertex = 207
@@ -17,6 +27,8 @@ def load_adj(dataset_name):
         n_vertex = 325
     elif dataset_name == 'pemsd7-m':
         n_vertex = 228
+    elif dataset_name == 'urban1':
+        n_vertex = 480
 
     return adj, n_vertex
 
