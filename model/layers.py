@@ -240,3 +240,118 @@ class OutputBlock(nn.Module):
         x = self.fc2(x).permute(0, 3, 1, 2)
 
         return x
+
+
+class TemporalRNNLayer(nn.Module):
+    def __init__(self, Kt, c_in, c_out, n_vertex, act_func, rnn_type='gru', num_layers=1):
+        super(TemporalRNNLayer, self).__init__()
+        self.Kt = Kt
+        self.c_in = c_in
+        self.c_out = c_out
+        self.n_vertex = n_vertex
+        self.act_func = act_func
+        self.align = Align(c_in, c_out)
+        self.rnn_type = rnn_type
+        
+        # (GRU or LSTM)
+        if rnn_type == 'gru':
+            self.rnn = nn.GRU(input_size=n_vertex, hidden_size=n_vertex, num_layers=num_layers, batch_first=True)
+        elif rnn_type == 'lstm':
+            self.rnn = nn.LSTM(input_size=n_vertex, hidden_size=n_vertex, num_layers=num_layers, batch_first=True)
+        else:
+            raise NotImplementedError(f'ERROR: RNN type {rnn_type} not implemented')
+
+        if act_func == 'glu' or act_func == 'gtu':
+            self.gate_fc = nn.Linear(c_out, c_out)
+        
+        self.relu = nn.ReLU()
+        self.silu = nn.SiLU()
+    
+    def forward(self, x):
+        batch_size, _, timestep, n_vertex = x.shape
+
+        x_in = self.align(x)
+
+        x_in_trimmed = x_in[:, :, self.Kt - 1:, :]
+        output_timestep = timestep - (self.Kt - 1)
+
+        x_rnn_in = x_in.permute(0, 1, 3, 2).contiguous()
+        x_rnn_in = x_rnn_in.view(batch_size * self.c_out, n_vertex, timestep)
+        x_rnn_in = x_rnn_in.permute(0, 2, 1).contiguous()
+
+        if self.rnn_type == 'gru':
+            x_rnn_out, _ = self.rnn(x_rnn_in)
+        else:
+            x_rnn_out, (_, _) = self.rnn(x_rnn_in)
+
+        x_rnn_out = x_rnn_out[:, -output_timestep:, :]
+        
+        x_rnn_out = x_rnn_out.permute(0, 2, 1).contiguous()  # [batch_size * c_out, n_vertex, output_timestep]
+        x_rnn_out = x_rnn_out.view(batch_size, self.c_out, n_vertex, output_timestep)
+        x_rnn_out = x_rnn_out.permute(0, 1, 3, 2).contiguous()  # [batch_size, c_out, output_timestep, n_vertex]
+        
+        if self.act_func == 'glu' or self.act_func == 'gtu':
+            x_p = x_rnn_out
+
+            x_gate = x_rnn_out.permute(0, 3, 2, 1).contiguous()
+            x_gate = x_gate.view(-1, self.c_out)
+            x_gate = self.gate_fc(x_gate)
+            x_gate = x_gate.view(batch_size, n_vertex, output_timestep, self.c_out)
+            x_gate = x_gate.permute(0, 3, 2, 1).contiguous()
+            
+            if self.act_func == 'glu':
+                x = torch.mul((x_p + x_in_trimmed), torch.sigmoid(x_gate))
+            else:
+                x = torch.mul(torch.tanh(x_p + x_in_trimmed), torch.sigmoid(x_gate))
+        
+        elif self.act_func == 'relu':
+            x = self.relu(x_rnn_out + x_in_trimmed)
+        
+        elif self.act_func == 'silu':
+            x = self.silu(x_rnn_out + x_in_trimmed)
+        
+        else:
+            raise NotImplementedError(f'ERROR: The activation function {self.act_func} is not implemented.')
+        
+        return x
+
+
+class STRNNBlock(nn.Module):
+    def __init__(self, Kt, Ks, n_vertex, last_block_channel, channels, act_func, gso, bias, droprate, edge_index, rnn_type='gru', num_layers=1):
+        super(STRNNBlock, self).__init__()
+        self.tmp_rnn1 = TemporalRNNLayer(Kt, last_block_channel, channels[0], n_vertex, act_func, rnn_type, num_layers)
+        self.edge_index = edge_index
+        self.graph_conv = GraphConvLayer(channels[0], channels[1], Ks, gso)
+        self.tmp_rnn2 = TemporalRNNLayer(Kt, channels[1], channels[2], n_vertex, act_func, rnn_type, num_layers)
+        self.tc2_ln = nn.LayerNorm([n_vertex, channels[2]], eps=1e-12)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(p=droprate)
+
+    def forward(self, x):
+        x = self.tmp_rnn1(x)
+        x = self.graph_conv(x, self.edge_index)
+        x = self.relu(x)
+        x = self.tmp_rnn2(x)
+        x = self.tc2_ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        x = self.dropout(x)
+        return x
+
+
+class RNNOutputBlock(nn.Module):
+    def __init__(self, Ko, last_block_channel, channels, end_channel, n_vertex, act_func, bias, droprate, rnn_type='gru', num_layers=1):
+        super(RNNOutputBlock, self).__init__()
+        self.tmp_rnn1 = TemporalRNNLayer(Ko, last_block_channel, channels[0], n_vertex, act_func, rnn_type, num_layers)
+        self.fc1 = nn.Linear(in_features=channels[0], out_features=channels[1], bias=bias)
+        self.fc2 = nn.Linear(in_features=channels[1], out_features=end_channel, bias=bias)
+        self.tc1_ln = nn.LayerNorm([n_vertex, channels[0]], eps=1e-12)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(p=droprate)
+
+    def forward(self, x):
+        x = self.tmp_rnn1(x)
+        x = self.tc1_ln(x.permute(0, 2, 3, 1))
+        x = self.fc1(x)
+        x = self.relu(x)
+        x = self.dropout(x)
+        x = self.fc2(x).permute(0, 3, 1, 2)
+        return x

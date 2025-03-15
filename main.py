@@ -50,6 +50,9 @@ def get_parameters():
     parser.add_argument('--act_func', type=str, default='glu', choices=['glu', 'gtu'])
     parser.add_argument('--Ks', type=int, default=3, choices=[3, 2])
     parser.add_argument('--graph_conv_type', type=str, default='cheb_graph_conv', choices=['cheb_graph_conv', 'graph_conv'])
+    parser.add_argument('--model_type', type=str, default='conv', choices=['conv', 'rnn'], help='model type: conv for original STGCN, rnn for RNN-based STGCN')
+    parser.add_argument('--rnn_type', type=str, default='gru', choices=['gru', 'lstm'], help='RNN type to use (if model_type=rnn)')
+    parser.add_argument('--rnn_layers', type=int, default=1, help='Number of RNN layers (if model_type=rnn)')
     parser.add_argument('--gso_type', type=str, default='sym_norm_lap', choices=['sym_norm_lap', 'rw_norm_lap', 'sym_renorm_adj', 'rw_renorm_adj'])
     parser.add_argument('--enable_bias', type=bool, default=True, help='default as True')
     parser.add_argument('--droprate', type=float, default=0.5)
@@ -141,12 +144,20 @@ def data_preparate(args, device):
 
 def prepare_model(args, blocks, n_vertex, adj_train, adj_val, adj_test, mode):
     loss = nn.MSELoss()
+
+    if args.model_type == 'rnn':
+        model_name = "STRNN"
+    else:
+        model_name = "STGCN"
     es = earlystopping.EarlyStopping(delta=0.0, 
                                      patience=args.patience, 
                                      verbose=True, 
-                                     path="STGCN_" + args.dataset + ".pt")
+                                     path=f"{model_name}_{args.dataset}.pt")
 
-    model = models.STGCNGraphConv(args, blocks, n_vertex, adj_train, adj_val, adj_test, mode).to(device)
+    if args.model_type == 'rnn':
+        model = models.STRNNGraphConv(args, blocks, n_vertex, adj_train, adj_val, adj_test, mode).to(device)
+    else:
+        model = models.STGCNGraphConv(args, blocks, n_vertex, adj_train, adj_val, adj_test, mode).to(device)
 
     if args.opt == "adamw":
         optimizer = optim.AdamW(params=model.parameters(), lr=args.lr, weight_decay=args.weight_decay_rate)
@@ -199,12 +210,16 @@ def val(model, val_iter):
 
 @torch.no_grad() 
 def test(zscore, loss, model, test_iter, args):
-    model.load_state_dict(torch.load("STGCN_" + args.dataset + ".pt"))
+    if args.model_type == 'rnn':
+        model_name = "STRNN"
+    else:
+        model_name = "STGCN"
+    model.load_state_dict(torch.load(f"{model_name}_{args.dataset}.pt"))
     model.eval()
 
     test_MSE = utility.evaluate_model(model, loss, test_iter)
     test_MAE, test_RMSE, test_WMAPE = utility.evaluate_metric(model, test_iter, zscore)
-    print(f'Dataset {args.dataset:s} | Test loss {test_MSE:.6f} | MAE {test_MAE:.6f} | RMSE {test_RMSE:.6f} | WMAPE {test_WMAPE:.8f}')
+    print(f'Model: {model_name} | Dataset: {args.dataset:s} | Test loss {test_MSE:.6f} | MAE {test_MAE:.6f} | RMSE {test_RMSE:.6f} | WMAPE {test_WMAPE:.8f}')
 
 if __name__ == "__main__":
     # Logging
